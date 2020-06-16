@@ -1,0 +1,277 @@
+with reg as (
+    select case
+               when coalesce(agg.cnt_mths_extended, 0) > 0 then 'T-Credit'
+               else 'T-Free'
+               end                                                        as acc_type,
+           substr(agg.personal_id,5,2)::integer||'.'
+                                  ||(substr(agg.personal_id,3,2)::integer-case
+                                                                            when substr(agg.personal_id,3,2)::integer > 80 then 80
+                                                                            when substr(agg.personal_id,3,2)::integer > 60 then 60
+                                                                            when substr(agg.personal_id,3,2)::integer > 40 then 40
+                                                                            when substr(agg.personal_id,3,2)::integer > 20 then 20
+                                                                            else 0
+                                                                          end)::text||'.'
+                                  ||substr(agg.personal_id,1,2)::integer+case
+                                                                            when substr(agg.personal_id,3,2)::integer > 80 then 1800
+                                                                            when substr(agg.personal_id,3,2)::integer > 12 then 2000
+                                                                            else 1900
+                                                                          end as birth_date,
+           d.desired_limit,
+           agg.*
+    from z_account_agg agg
+             left join
+         (
+             select r.customer_id as account_id, e.desired_limit
+             from customer_upgraderequest r
+                      inner join
+                  customer_upgraderequestextrainfo e on e.upgrade_request_id = r.id
+             where r.date_accepted is not null
+               and r.site = 2
+         ) d on d.account_id = agg.account_id
+    where agg.site = 2 -- only Poland
+      and agg.is_active is true
+      and agg.limit > 0 -- limit must be higher than 0
+),
+    pcy as (-- platebni kapacita podle CZ prevedena na zloty (naklady za bydleni jsou zjednoduseny), nerozlisuji muze a zeny, nepouzivam adjust coeff, jako vydaje beru vyssi cislo z modelu a castky, kterou uvedl klient
+    select zz.account_id,
+       zz.income_amount,
+       zz.nbr_adults,
+       zz.family_children,
+       zz.adjust_coeff,
+       zz.expense_debt,
+       zz.disposable_income,
+       zz.expenses,
+       zz.housing_expenses,
+       zz.income_type,
+       zz.expense_client,
+       zz.total_score,
+       zz.age,
+       zz.total_expenses,
+       zz.income_amount - greatest(zz.total_expenses, zz.expense_client) as pay_cpcy,
+       case
+         when zz.total_score >= 462 then 1.35 -- 9 decil score
+         when zz.total_score >= 439 then 1.30 -- 8 decil score
+         when zz.total_score >= 420 then 1.25 -- 7 decil score
+         when zz.total_score >= 401 then 1.20 -- 6 decil score
+         when zz.total_score >= 383 then 1.15 -- 5 decil score
+         when zz.total_score >= 364 then 1.10 -- 4 decil score
+         when zz.total_score >= 342 then 1.05 -- 3 decil score
+         else 1.00
+       end as coeff_daily_lmt_boost
+from (
+         select z.account_id,
+                z.income_amount,
+                z.nbr_adults,
+                z.family_children,
+                z.adjust_coeff,
+                z.expense_debt,
+                z.disposable_income,
+                z.expenses,
+                z.housing_expenses,
+                z.income_type,
+                z.expense_client,
+                z.total_score,
+                z.age,
+                ceil(case
+                         when z.income_type = 7 then z.expenses /** z.adjust_coeff*/ -- studenti
+                         when z.nbr_adults > 1 then (z.expenses + z.housing_expenses) /** z.adjust_coeff*/ * 0.5
+                         else (z.expenses + z.housing_expenses) /** z.adjust_coeff*/
+                         end + z.expense_debt) as total_expenses
+         from (
+                  select y.account_id,
+                         y.income_amount,
+                         y.nbr_adults,
+                         y.family_children,
+                         y.adjust_coeff,
+                         y.expense_debt,
+                         y.disposable_income,
+                         y.income_type,
+                         y.expense_client,
+                         y.total_score,
+                         y.age,
+                         case
+                             when y.nbr_adults + y.family_children = 1 then 3410
+                             else 3140 + (y.nbr_adults - 1) * 2830 + y.family_children * 2140
+                             end / (5.94) as expenses,
+                         case
+                             when y.age > 59 then /*retired*/
+                                 case
+                                     when y.nbr_adults + y.family_children = 1 then 4670
+                                     when y.nbr_adults + y.family_children = 2 then 6661
+                                     when y.nbr_adults + y.family_children = 3 then 9050
+                                     when y.nbr_adults + y.family_children >= 4 then 11268
+                                     else 88888888880
+                                     end
+                             else /*all others*/
+                                 case
+                                     when y.nbr_adults + y.family_children = 1 then 6541
+                                     when y.nbr_adults + y.family_children = 2 then 9129
+                                     when y.nbr_adults + y.family_children = 3 then 12260
+                                     when y.nbr_adults + y.family_children >= 4 then 15154
+                                     else 88888888881
+                                     end
+                             end / (5.94) as housing_expenses
+                  from (
+                           select x.account_id,
+                                  x.income_amount,
+                                  x.nbr_adults,
+                                  x.expense_debt,
+                                  x.disposable_income,
+                                  x.age,
+                                  x.income_type,
+                                  x.expense_client,
+                                  x.total_score,
+                                  case
+                                      when x.age < 50 then x.family_children
+                                      else 0
+                                      end as family_children,
+                                  x.adjust_coeff
+                           from (
+                                    select z.account_id,
+                                           z.income_amount,
+                                           z.family_children,
+                                           z.income_type,
+                                           z.disposable_income,
+                                           z.expense_amount as expense_client,
+                                           z.total_score,
+                                           extract('years' from
+                                                   age(z.date_accepted::date, to_date(r.birth_date, 'dd.mm.yyyy'))) as age,
+                                           z.expense_debt,
+                                           case
+                                               when z.family_type in (1, 5, 3, 6) then 1
+                                               else 2
+                                               end                                                                  as nbr_adults,
+                                           case
+                                               when income_type = 1 then 1.1 -- employees
+                                               when income_type = 2 then 1.2 --retired
+                                               when income_type = 3 then 1.3 --maternity leave
+                                               when income_type = 4 then 1.0 * 1.5 --self-employed
+                                               when income_type = 5 then 1.0 * 1.5 --unemployed
+                                               when income_type = 6 then 1.5 * 1.5 --other
+                                               when income_type = 7 then 1.0  --student
+                                               else 0.0 -- this shall be never the case
+                                               end                                                                  as adjust_coeff
+                                    from z_request z
+                                             inner join
+                                         reg r on r.account_id = z.account_id
+                                    where z.account_id is not null
+                                      and z.site = 2
+                                      and z.date_accepted is not null
+                                ) x
+                       ) y
+              ) z
+     ) zz
+    ),
+out1 as (
+/*select count(*), sum(case when yn_tcash is true then 1 else 0 end),
+       avg(actual_daily_limit), avg(target_daily_limit),
+       avg(target_daily_limit)/avg(actual_daily_limit),
+       min(instalment_limit), max(instalment_limit),
+       min(max_monthly_repayment), max(max_monthly_repayment)
+from (*/
+     select --count(*)
+         x.account_id,
+    x.date_upgraded,
+       x.acc_type,
+     case when x.acc_type = 'T-Free' then extract('days' from current_timestamp - x.date_upgraded)
+         else null
+       end as tfree_days,
+    x."limit" as actual_daily_limit,
+     floor(least(x."limit" * y.coeff_daily_lmt_boost, y.income_amount, 5000)/50) * 50 as target_daily_limit,
+     floor(least((floor(y.pay_cpcy - 0.1 * least(x."limit" * y.coeff_daily_lmt_boost, y.income_amount, 5000)) * 12)/1.43,
+                   least(x."limit" * y.coeff_daily_lmt_boost, y.income_amount, 5000)*0.7)/20) * 20 as instalment_limit, -- min(50% instl limitu, cpcy * 12/1.43) ve druhem clenu se deli 1.43 s ohledem na max poplatek 43% p.a.
+     floor(y.pay_cpcy - 0.1 * least(x."limit" * y.coeff_daily_lmt_boost, y.income_amount, 5000)) as max_monthly_repayment,
+     case when y.total_score >= 462                          then true
+         when y.total_score >= 420 and x.cnt_mths_paid >= 3 then true
+         when y.total_score >= 401 and floor(least(x."limit" * y.coeff_daily_lmt_boost, y.income_amount, 5000)/50) * 50 >= 3000 then true
+         else false
+       end as yn_tcash
+from   reg x
+       inner join
+       pcy y on y.account_id=x.account_id
+where  y.age between 21 and 69 -- age between 21 and 67
+       and not (x.acc_type = 'T-Free' and extract('days' from current_timestamp - x.date_upgraded) < 120) -- not Twisto Free accounts younger 120 days
+       and coalesce(x.cnt_rejected_ids, 0) <= 1 -- max 1 odmitnuti
+       and x.default_6_mth is null  -- ne 6M defaulty
+       and x.default_11_mth is null -- ne 11M defaulty
+       and x.cnt_mths_paid >= 1 -- aspon 1 zaplacenou fakturu
+       and x.cnt_mths_live > 1 -- vice nez 1 mesic na knize
+       and x.account_id not in (select account_id from z_account_life where  acc_limit_end < acc_limit_start or eom_limit < som_limit) -- nesnizoval se v minulosti limit
+       and x.desired_limit <= x.limit -- nebyl snizovan puvodni limit
+       --and y.disposable_income > 0
+       and y.income_amount > 1000 -- prijem aspon 1000 zlotych
+       and y.pay_cpcy >= 200 -- dispo aspon 200 zlotych
+       and y.total_score >= 364 -- ne nejhorsi 3 decily score
+       and x.account_id not in (-- historicky nedluzili vice nez 5 DPD
+                                select b.account_id
+                                from   z_basic b
+                                where  b.site = 2
+                                       and b.invoice_status_code >= 4
+                                       and b.account_id  is not null
+                                       and b.date_returned is null
+                                       and b.date_cancelled is null
+                                       and current_date >= b.date_activated::date
+                                       and current_date > b.date_due
+                                       and b.date_paid is not null
+                                       and b.date_paid::date - b.date_due > 5
+                               )
+       and x.account_id not in (-- aktualne nedluzi
+                                select b.account_id
+                                from   z_basic b
+                                where  b.site = 2
+                                       and b.invoice_status_code >= 4
+                                       and b.account_id  is not null
+                                       and b.date_returned is null
+                                       and b.date_cancelled is null
+                                       and current_date >= b.date_activated::date
+                                       and current_date >= b.date_due
+                                       and b.date_paid is null
+                                       and current_date - b.date_due <= 0
+                               )
+       and x.account_id not in (-- nechci klienty, kteri maji aspon 1 faktury, odlozili alspon 3x a jeste ji nezaplatili
+                                select account_id
+                                from   z_basic
+                                where  site = 2
+                                       and payment_deferred is true
+                                       and date_paid is null
+                                       and date_due>='2019-10-01'
+                                       and extract('years' from age(date_due, initial_date_due))*12 + extract('months' from age(date_due, initial_date_due)) >= 3
+                               )
+       and x.account_id  not in (-- nechci fraudy a black listy
+                                 select b.account_id
+                                 from   z_basic b
+                                 where  b.site = 2 and b.account_id is not null and (b.is_blacklisted is true or b.fraud_id is not null)
+                                )
+       and x.account_id not in (-- nechci odkladace, ty budu resit jinou kampani na behav score
+                                select account_id from z_account_life where amt_extended > 1 and site = 2
+                                )
+       and floor(least((floor(y.pay_cpcy - 0.1 * least(x."limit" * y.coeff_daily_lmt_boost, y.income_amount, 5000)) * 12)/1.43,
+                       least(x."limit" * y.coeff_daily_lmt_boost, y.income_amount, 5000))/10) * 10 >= 170 -- instalment limit aspon 500 PLN
+order by 1
+    )
+select account_id,
+       date_upgraded,
+       acc_type,
+       tfree_days,
+       actual_daily_limit,
+       target_daily_limit,
+       instalment_limit,
+       max_monthly_repayment,
+       yn_tcash
+from (
+select --count(*), percentile_disc(0.25) within group (order by t.instalment_limit), percentile_disc(0.5) within group (order by t.instalment_limit), percentile_disc(0.75) within group (order by t.instalment_limit),
+       *,
+       row_number() over (order by case when  instalment_limit between 0 and 1000 then 1000
+       when instalment_limit between 1000 and 1500 then 1500
+       else 2000
+       end, account_id) as rnum,
+       case when  instalment_limit between 0 and 1000 then 1000
+       when instalment_limit between 1000 and 1500 then 1500
+       else 2000
+       end as segment
+from   out1 t
+where t.instalment_limit >= 700
+) xy
+where xy.segment in (1500,2000) or (xy.segment = 1000 and mod(rnum, 2) = 0)
+--group by 1
+order by account_id
