@@ -242,9 +242,9 @@ where  y.age between 21 and 69 -- age between 21 and 67
                                  from   z_basic b
                                  where  b.site = 2 and b.account_id is not null and (b.is_blacklisted is true or b.fraud_id is not null)
                                 )
-       and x.account_id not in (-- nechci odkladace, ty budu resit jinou kampani na behav score
+       /*and x.account_id not in (-- nechci odkladace, ty budu resit jinou kampani na behav score
                                 select account_id from z_account_life where amt_extended > 1 and site = 2
-                                )
+                                )*/
        and floor(least((floor(y.pay_cpcy - 0.1 * least(x."limit" * y.coeff_daily_lmt_boost, y.income_amount, 5000)) * 12)/1.43,
                        least(x."limit" * y.coeff_daily_lmt_boost, y.income_amount, 5000))/10) * 10 >= 170 -- instalment limit aspon 500 PLN
 order by 1
